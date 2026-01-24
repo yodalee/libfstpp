@@ -26,6 +26,7 @@ struct VariableInfo final {
 	uint32_t last_written_bytes;
 	const uint16_t bitwidth;
 	const bool is_real;
+    uint64_t prev_time;
 	// } 8 bytes
 
 	// end of data members
@@ -58,7 +59,7 @@ struct VariableInfo final {
 	VariableInfo& operator=(const VariableInfo&) = delete;
 	VariableInfo& operator=(VariableInfo&&) = delete;
 };
-static_assert(sizeof(VariableInfo) <= 32, "VariableInfoBase should be small");
+static_assert(sizeof(VariableInfo) <= 40, "VariableInfoBase should be small");
 
 namespace detail {
 
@@ -155,10 +156,12 @@ private:
 			// and then add the new value
 			info.data.resize(0);
 		}
-		StreamVectorWriteHelper(info.data)
-		.Write(current_time_index) // time index
-		.Write(encoding) // encoding
-		;
+        if (info.bitwidth != 1) {
+            StreamVectorWriteHelper(info.data)
+            .Write(current_time_index) // time index
+            .Write(encoding) // encoding
+            ;
+        }
 	}
 
 	inline uint64_t ComputeEmitMemory(EncodingType encoding) {
@@ -167,18 +170,48 @@ private:
 
 public:
 	void Construct() {
-		StreamVectorWriteHelper(info.data)
-		.Write(uint64_t(0)) // initial time index (don't care)
-		.Write(EncodingType::eVerilog) // initial encoding
-		.Write(T(0)).Write(T(-1)) // initial X value
-		;
+        if (info.bitwidth == 1) {
+            info.prev_time = 0;
+            StreamVectorWriteHelper(info.data)
+            .Write(T(1)) // initial 'x' value
+            ;
+        } else {
+            StreamVectorWriteHelper(info.data)
+            .Write(uint64_t(0)) // initial time index (don't care)
+            .Write(EncodingType::eVerilog) // initial encoding
+            .Write(T(0)).Write(T(-1)) // initial X value
+            ;
+        }
 	}
 
 	uint64_t EmitValueChange(uint64_t current_time_index, const uint64_t val) {
-		EmitValueChangeCommonPart(current_time_index, EncodingType::eBinary);
-		StreamVectorWriteHelper(info.data)
-		.Write<T>(val);
-		return sizeof(uint64_t) + sizeof(EncodingType) + ComputeEmitMemory(EncodingType::eBinary);
+        StreamVectorWriteHelper h(info.data);
+        if (info.bitwidth == 1) {
+			uint64_t delta_time_index = current_time_index - info.prev_time;
+			switch (val) {
+			case 0: delta_time_index = (delta_time_index<<2) | (0<<1) | 0; break; // '0'
+			case 1: delta_time_index = (delta_time_index<<2) | (1<<1) | 0; break; // '1'
+			case 2: delta_time_index = (delta_time_index<<4) | (0<<1) | 1; break; // 'X'
+			case 3: delta_time_index = (delta_time_index<<4) | (1<<1) | 1; break; // 'Z'
+			// Not supporting VHDL now
+			// LCOV_EXCL_START
+			case 4: delta_time_index = (delta_time_index<<4) | (2<<1) | 1; break; // 'H'
+			case 5: delta_time_index = (delta_time_index<<4) | (3<<1) | 1; break; // 'U'
+			case 6: delta_time_index = (delta_time_index<<4) | (4<<1) | 1; break; // 'W'
+			case 7: delta_time_index = (delta_time_index<<4) | (5<<1) | 1; break; // 'L'
+			case 8: delta_time_index = (delta_time_index<<4) | (6<<1) | 1; break; // '-'
+			case 9: delta_time_index = (delta_time_index<<4) | (7<<1) | 1; break; // '?'
+			default: break;
+			// LCOV_EXCL_STOP
+			}
+			h.WriteLEB128(delta_time_index);
+            info.prev_time = current_time_index;
+            return ComputeEmitMemory(EncodingType::eBinary);
+        } else {
+            EmitValueChangeCommonPart(current_time_index, EncodingType::eBinary);
+            h.Write<T>(val);
+            return sizeof(uint64_t) + sizeof(EncodingType) + ComputeEmitMemory(EncodingType::eBinary);
+        }
 	}
 
 	uint64_t EmitValueChange(uint64_t current_time_index, const uint32_t* val, EncodingType encoding) {
@@ -210,6 +243,10 @@ public:
 	}
 
 	void DumpInitialBits(std::vector<uint8_t> &buf) const {
+        if (info.bitwidth == 1) {
+            buf.push_back(info.data[0]);
+            return;
+        }
 		// FST requires initial bits present
 		DCHECK_GT(info.data.size(), sizeof(uint64_t) + sizeof(EncodingType));
 		StreamVectorReaderHelper rh(info.data.data());
@@ -265,45 +302,47 @@ public:
 		bool first = true;
 		uint64_t prev_time_index = 0;
 		if (bitwidth == 1) {
-			while (true) {
-				if (rh.ptr == tail) {
-					break;
-				}
-				DCHECK_GT(tail, rh.ptr);
-				const auto time_index = rh.Read<uint64_t>();
-				const auto enc = rh.Read<EncodingType>();
-				const auto num_element = BitPerEncodedBit(enc);
-				const auto num_byte = num_element * sizeof(T);
-				if (first) {
-					// Note: [0] is initial value, which is already dumped in DumpInitialBits()
-					first = false;
-				} else {
-					unsigned val = 0;
-					for (unsigned i = 0; i < num_element; ++i) {
-						val |= rh.Peek<T>(i);
-					}
-					uint64_t delta_time_index = time_index - prev_time_index;
-					prev_time_index = time_index;
-					switch (val) {
-					case 0: delta_time_index = (delta_time_index<<2) | (0<<1) | 0; break; // '0'
-					case 1: delta_time_index = (delta_time_index<<2) | (1<<1) | 0; break; // '1'
-					case 2: delta_time_index = (delta_time_index<<4) | (0<<1) | 1; break; // 'X'
-					case 3: delta_time_index = (delta_time_index<<4) | (1<<1) | 1; break; // 'Z'
-					// Not supporting VHDL now
-					// LCOV_EXCL_START
-					case 4: delta_time_index = (delta_time_index<<4) | (2<<1) | 1; break; // 'H'
-					case 5: delta_time_index = (delta_time_index<<4) | (3<<1) | 1; break; // 'U'
-					case 6: delta_time_index = (delta_time_index<<4) | (4<<1) | 1; break; // 'W'
-					case 7: delta_time_index = (delta_time_index<<4) | (5<<1) | 1; break; // 'L'
-					case 8: delta_time_index = (delta_time_index<<4) | (6<<1) | 1; break; // '-'
-					case 9: delta_time_index = (delta_time_index<<4) | (7<<1) | 1; break; // '?'
-					default: break;
-					// LCOV_EXCL_STOP
-					}
-					h.WriteLEB128(delta_time_index);
-				}
-				rh.Skip(num_byte);
-			}
+            // skip first byte of initial value
+            std::copy(info.data.begin()+1, info.data.end(), std::back_inserter(buf));
+			// while (true) {
+			// 	if (rh.ptr == tail) {
+			// 		break;
+			// 	}
+			// 	DCHECK_GT(tail, rh.ptr);
+			// 	const auto time_index = rh.Read<uint64_t>();
+			// 	const auto enc = rh.Read<EncodingType>();
+			// 	const auto num_element = BitPerEncodedBit(enc);
+			// 	const auto num_byte = num_element * sizeof(T);
+			// 	if (first) {
+			// 		// Note: [0] is initial value, which is already dumped in DumpInitialBits()
+			// 		first = false;
+			// 	} else {
+			// 		unsigned val = 0;
+			// 		for (unsigned i = 0; i < num_element; ++i) {
+			// 			val |= rh.Peek<T>(i);
+			// 		}
+			// 		uint64_t delta_time_index = time_index - prev_time_index;
+			// 		prev_time_index = time_index;
+			// 		switch (val) {
+			// 		case 0: delta_time_index = (delta_time_index<<2) | (0<<1) | 0; break; // '0'
+			// 		case 1: delta_time_index = (delta_time_index<<2) | (1<<1) | 0; break; // '1'
+			// 		case 2: delta_time_index = (delta_time_index<<4) | (0<<1) | 1; break; // 'X'
+			// 		case 3: delta_time_index = (delta_time_index<<4) | (1<<1) | 1; break; // 'Z'
+			// 		// Not supporting VHDL now
+			// 		// LCOV_EXCL_START
+			// 		case 4: delta_time_index = (delta_time_index<<4) | (2<<1) | 1; break; // 'H'
+			// 		case 5: delta_time_index = (delta_time_index<<4) | (3<<1) | 1; break; // 'U'
+			// 		case 6: delta_time_index = (delta_time_index<<4) | (4<<1) | 1; break; // 'W'
+			// 		case 7: delta_time_index = (delta_time_index<<4) | (5<<1) | 1; break; // 'L'
+			// 		case 8: delta_time_index = (delta_time_index<<4) | (6<<1) | 1; break; // '-'
+			// 		case 9: delta_time_index = (delta_time_index<<4) | (7<<1) | 1; break; // '?'
+			// 		default: break;
+			// 		// LCOV_EXCL_STOP
+			// 		}
+			// 		h.WriteLEB128(delta_time_index);
+			// 	}
+			// 	rh.Skip(num_byte);
+			// }
 		} else {
 			while (true) {
 				if (rh.ptr == tail) {
